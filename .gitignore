@@ -1,0 +1,11 @@
+# Salidas de compilacion de ESP-IDF
+build/
+
+# Dependencias que idf.py descarga segun dependencies.lock
+managed_components/
+
+# Copia automatica de la configuracion
+sdkconfig.old
+
+# Configuracion local del editor (rutas de cada equipo)
+.vscode/
