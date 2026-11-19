@@ -28,7 +28,7 @@ void app_main(void)
         buttons_init();       /* GPIO8 = alternar pantalla ON/OFF */
     }
 
-    charge_init();      /* GPIO1 = LED de carga: detiene/reanuda el BLE */
+    charge_init();      /* modo carga (CMD 0xC0 de la app) */
     ble_stream_init();
 
     xTaskCreate(test_bmi270_task, "test_bmi270", 8192, NULL, 5, NULL);

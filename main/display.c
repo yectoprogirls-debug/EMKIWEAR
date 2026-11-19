@@ -427,3 +427,16 @@ bool display_is_on(void)
 {
     return s_on;
 }
+
+void display_backlight_hold(bool hold)
+{
+    if (!s_ready) {
+        return;
+    }
+    if (hold) {
+        gpio_set_level(PIN_BLK, !BLK_ON_LEVEL);
+        gpio_hold_en(PIN_BLK);
+    } else {
+        gpio_hold_dis(PIN_BLK);
+    }
+}

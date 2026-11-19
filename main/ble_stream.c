@@ -9,6 +9,7 @@
 #include "ble_stream.h"
 #include "hourly_summary.h"
 #include "bmi270_esp32.h"
+#include "charge.h"
 
 #include <string.h>
 #include <math.h>
@@ -119,6 +120,7 @@ static uint16_t s_raw_handle;
 static uint16_t s_rawfifo_handle;       /* 0x08 */
 static uint16_t s_cmd_handle;           /* 0x04 (ahora tambien NOTIFY+READ, para INFO) */
 static uint16_t s_sev_handle;           /* 0x0A (severidad, escala MDS-UPDRS) */
+static uint16_t s_batt_handle;          /* 0x09 (bateria / aviso de modo carga) */
 static bool     s_sample_subscribed;
 static bool     s_status_subscribed;
 static bool     s_ext_subscribed;
@@ -126,16 +128,17 @@ static bool     s_summary_subscribed;
 static bool     s_raw_subscribed;
 static bool     s_rawfifo_subscribed;
 static bool     s_sev_subscribed;
+static bool     s_batt_subscribed;
 static uint32_t s_summary_sent_upto;   /* mayor seq enviado en esta conexion */
 static bool     s_streaming = true;     /* stream SAMPLE */
 static bool     s_raw_streaming = true; /* stream RAW (0x07) */
 static uint8_t  s_own_addr_type;
 static uint16_t s_att_payload = 20;     /* MTU-3 negociado; 20 = por defecto (MTU 23) */
 
-/* ---- BLE activo/detenido (ble_stream_set_enabled) ---- */
+/* ---- false solo mientras ble_stream_deinit() apaga el stack (link_down) ---- */
 static volatile bool    s_enabled = true;
-static volatile bool    s_enable_ev_ready;
-static struct ble_npl_event s_enable_ev;
+static bool             s_running;      /* stack NimBLE arrancado */
+static struct ble_npl_event s_link_down_ev;
 
 /* ---- robustez de notify() ---- */
 #define BLE_DROP_LOG_PERIOD_US   (5 * 1000000LL)  /* resumen de descartes cada 5 s */
@@ -151,6 +154,7 @@ static uint32_t s_raw_mtu_cnt;          /* contador para RAW a 25 Hz con MTU 23 
 /* ---- STATUS nunca se pierde ---- */
 #define BLE_STATUS_TIMER_US      (250 * 1000)     /* periodo del timer de reenvio */
 #define BLE_STATUS_MAX_GAP_US    (1000 * 1000LL)  /* STATUS al menos 1 vez por segundo */
+#define BLE_DEINIT_WAIT_MS       2000             /* espera maxima a que cierre la conexion */
 static volatile bool s_status_pending = false;
 static int64_t       s_status_last_us = 0;
 static uint32_t      s_status_retries;          /* reenvios por fallo desde el ultimo resumen */
@@ -161,6 +165,13 @@ static ble_status_t s_last_status;
 static ble_ext_t    s_last_ext;
 static ble_raw_t    s_last_raw;
 static ble_sev_t    s_last_sev;
+/* BATT (0x09), 1 byte. No hay medicion de bateria en el hardware, asi que
+ * solo existen dos valores:
+ *   BLE_BATT_UNKNOWN     (0xFE): nivel desconocido; es lo que devuelve READ
+ *                                siempre en funcionamiento normal.
+ *   BLE_BATT_CHARGE_MODE (0xFF): se notifica una sola vez, justo antes de
+ *                                entrar en modo carga. */
+static uint8_t      s_last_batt = BLE_BATT_UNKNOWN;
 static uint8_t       s_rawfifo_pkt[sizeof(ble_rawfifo_hdr_t) +
                                    BLE_RAWFIFO_MAX_SAMPLES_PKT * sizeof(bmi270_raw_sample_t)];
 
@@ -177,7 +188,8 @@ static int  notify(uint16_t handle, const void *data, uint16_t len);
 static void send_status(void);
 static void status_timer_cb(void *arg);
 static void start_advertising(void);
-static void apply_enabled_ev(struct ble_npl_event *ev);
+static void link_down_ev(struct ble_npl_event *ev);
+static void link_down(void);
 
 /* ------------------------------------------------------------------ */
 /* Acceso a caracteristicas                                          */
@@ -217,6 +229,10 @@ static int gatt_access(uint16_t conn_handle, uint16_t attr_handle,
         }
         if (attr_handle == s_sev_handle) {
             return os_mbuf_append(ctxt->om, &s_last_sev, sizeof(s_last_sev))
+                       ? BLE_ATT_ERR_INSUFFICIENT_RES : 0;
+        }
+        if (attr_handle == s_batt_handle) {
+            return os_mbuf_append(ctxt->om, &s_last_batt, sizeof(s_last_batt))
                        ? BLE_ATT_ERR_INSUFFICIENT_RES : 0;
         }
         if (attr_handle == s_cmd_handle) {
@@ -265,6 +281,10 @@ static int gatt_access(uint16_t conn_handle, uint16_t attr_handle,
              * NOTIFY (si hay suscripcion) y ademas queda listo para READ. */
             ESP_LOGI(TAG, "INFO solicitada por el cliente");
             notify(s_cmd_handle, s_info_text, s_info_len);
+        } else if (cmd == BLE_CMD_CHARGE_MODE) {
+            /* la secuencia NO se ejecuta aqui (callback de NimBLE): solo se
+             * avisa a la tarea "charge", que es la que la hace */
+            charge_mode_request();
         }
         return 0;
     }
@@ -327,6 +347,12 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
                 .flags      = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
                 .val_handle = &s_sev_handle,
             },
+            {
+                .uuid       = WATCH_UUID128(0x09),   /* BATT (bateria / aviso de modo carga) */
+                .access_cb  = gatt_access,
+                .flags      = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+                .val_handle = &s_batt_handle,
+            },
             { 0 }
         },
     },
@@ -358,7 +384,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             s_conn_handle = event->connect.conn_handle;
             ESP_LOGI(TAG, "cliente conectado (handle %d)", s_conn_handle);
 
-            /* conexion que ya venia en camino cuando se detuvo el BLE */
+            /* conexion que ya venia en camino cuando se empezo a apagar el BLE */
             if (!s_enabled) {
                 ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
                 return 0;
@@ -404,6 +430,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         s_raw_subscribed = false;
         s_rawfifo_subscribed = false;
         s_sev_subscribed = false;
+        s_batt_subscribed = false;
         s_summary_sent_upto = 0;
         s_att_payload = 20;   /* vuelve al MTU por defecto hasta la proxima negociacion */
         start_advertising();
@@ -430,6 +457,8 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             s_rawfifo_subscribed = event->subscribe.cur_notify;
         } else if (event->subscribe.attr_handle == s_sev_handle) {
             s_sev_subscribed = event->subscribe.cur_notify;
+        } else if (event->subscribe.attr_handle == s_batt_handle) {
+            s_batt_subscribed = event->subscribe.cur_notify;
         }
         ESP_LOGI(TAG, "subscribe: sample=%d status=%d ext=%d summary=%d raw=%d rawfifo=%d sev=%d",
                  s_sample_subscribed, s_status_subscribed, s_ext_subscribed,
@@ -554,6 +583,11 @@ static void host_task(void *param)
 
 void ble_stream_init(void)
 {
+    if (s_running) {
+        return;
+    }
+    s_enabled = true;
+
     esp_err_t err = nimble_port_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "nimble_port_init fallo: %s", esp_err_to_name(err));
@@ -596,41 +630,100 @@ void ble_stream_init(void)
     ESP_LOGI(TAG, "INFO: %s", s_info_text);
 
     /* reenvio de STATUS: si fallo el ultimo o pasa >1 s sin mandarlo */
-    const esp_timer_create_args_t targs = {
-        .callback = status_timer_cb,
-        .name     = "ble_status",
-    };
-    esp_err_t terr = esp_timer_create(&targs, &s_status_timer);
-    if (terr == ESP_OK) {
+    esp_err_t terr = ESP_OK;
+    if (!s_status_timer) {     /* se crea una sola vez; ble_stream_deinit() solo lo para */
+        const esp_timer_create_args_t targs = {
+            .callback = status_timer_cb,
+            .name     = "ble_status",
+        };
+        terr = esp_timer_create(&targs, &s_status_timer);
+    }
+    if (terr == ESP_OK && !esp_timer_is_active(s_status_timer)) {
         terr = esp_timer_start_periodic(s_status_timer, BLE_STATUS_TIMER_US);
     }
     if (terr != ESP_OK) {
         ESP_LOGE(TAG, "timer de STATUS fallo: %s", esp_err_to_name(terr));
     }
 
-    ble_npl_event_init(&s_enable_ev, apply_enabled_ev, NULL);
-    s_enable_ev_ready = true;
+    ble_npl_event_init(&s_link_down_ev, link_down_ev, NULL);
 
+    s_last_batt = BLE_BATT_UNKNOWN;
+    s_running = true;
     nimble_port_freertos_init(host_task);
     ESP_LOGI(TAG, "BLE inicializado");
 }
 
+void ble_stream_stop_data(void)
+{
+    if (s_status_timer) {
+        esp_timer_stop(s_status_timer);   /* sin reenvios de STATUS */
+    }
+    s_status_pending = false;
+}
+
+void ble_stream_deinit(void)
+{
+    if (!s_running) {
+        return;
+    }
+
+    /* 1) desconexion ordenada y fin del advertising, en la tarea de NimBLE */
+    link_down();
+    for (int t = 0; t < BLE_DEINIT_WAIT_MS &&
+                    (s_conn_handle != BLE_HS_CONN_HANDLE_NONE || ble_gap_adv_active());
+         t += 20) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        ESP_LOGW(TAG, "la conexion no cerro en %d ms: se apaga el stack igual",
+                 BLE_DEINIT_WAIT_MS);
+    }
+    ble_stream_stop_data();
+
+    /* 2) host y controlador fuera: la radio queda apagada del todo y nada
+     *    del BLE queda pendiente durante el light sleep */
+    int rc = nimble_port_stop();
+    if (rc != 0) {
+        ESP_LOGE(TAG, "nimble_port_stop fallo (rc=%d): el stack BLE sigue arriba", rc);
+        return;
+    }
+    ble_npl_event_deinit(&s_link_down_ev);
+    esp_err_t err = nimble_port_deinit();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nimble_port_deinit fallo: %s", esp_err_to_name(err));
+    }
+
+    s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    s_sample_subscribed = false;
+    s_status_subscribed = false;
+    s_ext_subscribed = false;
+    s_summary_subscribed = false;
+    s_raw_subscribed = false;
+    s_rawfifo_subscribed = false;
+    s_sev_subscribed = false;
+    s_batt_subscribed = false;
+    s_summary_sent_upto = 0;
+    s_att_payload = 20;
+    s_running = false;
+    ESP_LOGI(TAG, "BLE apagado (host + controlador)");
+}
+
+void ble_stream_push_battery(uint8_t value)
+{
+    s_last_batt = value;
+    if (s_batt_subscribed) {
+        notify(s_batt_handle, &s_last_batt, sizeof(s_last_batt));
+    }
+}
+
 /* Corre en la tarea de NimBLE, igual que gap_event: asi no compite con el
  * re-publicitado que hace gap_event al desconectarse. */
-static void apply_enabled_ev(struct ble_npl_event *ev)
+static void link_down_ev(struct ble_npl_event *ev)
 {
     (void)ev;
     if (!ble_hs_synced()) {
         return;                 /* on_sync ya respeta s_enabled */
     }
-
-    if (s_enabled) {
-        if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE && !ble_gap_adv_active()) {
-            start_advertising();
-        }
-        return;
-    }
-
     if (ble_gap_adv_active()) {
         ble_gap_adv_stop();
     }
@@ -639,12 +732,12 @@ static void apply_enabled_ev(struct ble_npl_event *ev)
     }
 }
 
-void ble_stream_set_enabled(bool enabled)
+/* Desconecta al cliente y deja de publicitar (no se vuelve a publicitar
+ * hasta el proximo ble_stream_init()). */
+static void link_down(void)
 {
-    s_enabled = enabled;
-    if (s_enable_ev_ready) {
-        ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_enable_ev);
-    }
+    s_enabled = false;
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_link_down_ev);
 }
 
 /* ------------------------------------------------------------------ */

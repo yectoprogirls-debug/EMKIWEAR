@@ -37,6 +37,15 @@ esp_err_t bmi270_sensor_init(void);
 // (bmi270_fifo_enable / bmi270_fifo_read) en vez de esta funcion.
 bool bmi270_sensor_read(bmi270_data_t *out);
 
+// ---- Bajo consumo (modo carga) ----
+
+// Pone el BMI270 en suspend (accel+gyro apagados, advanced power save) y lo
+// saca de ahi. La configuracion (ODR, rangos, FIFO) se conserva; resume vacia
+// la FIFO. Llamar desde la MISMA tarea que lee el sensor (no hay mutex de I2C).
+// Devuelven ESP_ERR_INVALID_STATE si el sensor no llego a inicializarse.
+esp_err_t bmi270_sensor_suspend(void);
+esp_err_t bmi270_sensor_resume(void);
+
 // ---- FIFO: captura sin perdidas ni duplicados (para la característica 0x08) ----
 
 // Habilita la FIFO del BMI270 (header + accel + gyro). Llamar una vez,

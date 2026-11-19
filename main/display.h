@@ -53,6 +53,12 @@ void display_set_power(bool on);
 /* true si la pantalla esta encendida. */
 bool display_is_on(void);
 
+/* true: fuerza BLK al nivel de apagado y lo fija con gpio_hold_en, para que
+ * no cambie durante el light sleep. false: libera el pin (gpio_hold_dis).
+ * Usar con la pantalla ya apagada por display_set_power(false), y liberar
+ * antes de display_set_power(true). */
+void display_backlight_hold(bool hold);
+
 #ifdef __cplusplus
 }
 #endif

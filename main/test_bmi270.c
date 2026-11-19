@@ -115,6 +115,70 @@ static void push_status_analizando(uint32_t t_ms)
     ble_stream_push_status(t_ms, &res);
 }
 
+/* ---- pausa del muestreo para el modo carga (ver test_bmi270.h) ----
+ * Otra tarea levanta las peticiones; la tarea de muestreo las atiende ella
+ * misma, asi todo el I2C del BMI270 sigue saliendo de una sola tarea. */
+#define PAUSE_POLL_MS      20
+#define PAUSE_ACK_MAX_MS   1500
+
+static volatile bool s_pause_req;      /* peticion: detener el muestreo */
+static volatile bool s_paused;         /* la tarea esta detenida */
+static volatile bool s_sleep_req;      /* peticion: BMI270 a suspend */
+static volatile bool s_sleep_done;     /* la tarea ya atendio s_sleep_req */
+static volatile bool s_sleep_ok;       /* ...y el suspend salio bien */
+
+static bool wait_flag(volatile bool *flag)
+{
+    for (int t = 0; t < PAUSE_ACK_MAX_MS && !*flag; t += PAUSE_POLL_MS) {
+        vTaskDelay(pdMS_TO_TICKS(PAUSE_POLL_MS));
+    }
+    return *flag;
+}
+
+bool test_bmi270_pause(void)
+{
+    s_pause_req = true;
+    return wait_flag(&s_paused);
+}
+
+bool test_bmi270_sensor_sleep(void)
+{
+    if (!s_paused) {
+        return false;
+    }
+    s_sleep_req = true;
+    return wait_flag(&s_sleep_done) && s_sleep_ok;
+}
+
+void test_bmi270_resume(void)
+{
+    s_pause_req = false;
+}
+
+/* Se queda aqui mientras dure la pausa. Devuelve true si hubo pausa. */
+static bool pause_point(void)
+{
+    if (!s_pause_req) {
+        return false;
+    }
+    s_paused = true;
+    while (s_pause_req) {
+        if (s_sleep_req && !s_sleep_done) {
+            s_sleep_ok   = (bmi270_sensor_suspend() == ESP_OK);
+            s_sleep_done = true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(PAUSE_POLL_MS));
+    }
+    if (s_sleep_done && s_sleep_ok) {
+        bmi270_sensor_resume();        /* tambien vacia la FIFO */
+    }
+    s_sleep_req  = false;
+    s_sleep_done = false;
+    s_sleep_ok   = false;
+    s_paused     = false;
+    return true;
+}
+
 #define SHOW_SIN_MIN_HOPS 3   /* SIN TEMBLOR debe durar 3 ventanas (1.5 s) para mostrarse */
 
 /* Pipeline completo por muestra (una llamada = una muestra real o
@@ -310,6 +374,17 @@ void test_bmi270_task(void *pvParameters)
 
     while (1) {
         vTaskDelayUntil(&next, PERIOD_TICKS);
+
+        if (pause_point()) {
+            /* vuelta del modo carga: no hay continuidad con lo anterior */
+            tremor_reset(st.tr);
+            st.have_last  = false;
+            st.primer_res = false;      /* "Analizando..." hasta el primer resultado */
+            next = xTaskGetTickCount();
+            fifo_log_last_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            ESP_LOGI(TAG, "Muestreo reanudado.");
+            continue;
+        }
 
         uint32_t t_read_ms = (uint32_t)(esp_timer_get_time() / 1000);
 

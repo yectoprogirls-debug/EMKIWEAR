@@ -44,6 +44,9 @@ static const char *TAG = "BMI270_ESP32";
 
 static struct bmi2_dev s_bmi;
 static i2c_master_dev_handle_t s_i2c_dev;
+static bool    s_ready;        // bmi270_sensor_init() termino bien
+static bool    s_suspended;    // en suspend (modo carga)
+static uint8_t s_aps_before;   // advanced power save antes de suspender
 
 // ------- Funciones "glue" que el driver de Bosch necesita -------
 
@@ -241,6 +244,64 @@ esp_err_t bmi270_sensor_init(void)
 
     ESP_LOGI(TAG, "Accel+Gyro configurados y habilitados a 50Hz (ODR): "
                   "accel bwp=NORMAL_AVG4 filter_perf=OPT, gyro bwp=NORMAL noise/filter_perf=OPT");
+    s_ready = true;
+    return ESP_OK;
+}
+
+// ------- Suspend / resume (modo carga) -------
+// Suspend del BMI270 = accel y gyro deshabilitados (PWR_CTRL) + advanced
+// power save activo (PWR_CONF): unos pocos uA. Los registros de configuracion
+// (ODR, rangos, FIFO) se conservan, asi que al volver basta con rehabilitar.
+
+esp_err_t bmi270_sensor_suspend(void)
+{
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_suspended) {
+        return ESP_OK;
+    }
+
+    s_aps_before = s_bmi.aps_status;
+
+    uint8_t sensor_list[2] = { BMI2_ACCEL, BMI2_GYRO };
+    int8_t rslt = bmi2_sensor_disable(sensor_list, 2, &s_bmi);
+    if (rslt == BMI2_OK) {
+        rslt = bmi2_set_adv_power_save(BMI2_ENABLE, &s_bmi);
+    }
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(TAG, "suspend fallo, rslt=%d", rslt);
+        return ESP_FAIL;
+    }
+    s_suspended = true;
+    ESP_LOGI(TAG, "BMI270 en suspend");
+    return ESP_OK;
+}
+
+esp_err_t bmi270_sensor_resume(void)
+{
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_suspended) {
+        return ESP_OK;
+    }
+
+    int8_t rslt = bmi2_set_adv_power_save(s_aps_before, &s_bmi);
+    if (rslt == BMI2_OK) {
+        uint8_t sensor_list[2] = { BMI2_ACCEL, BMI2_GYRO };
+        rslt = bmi2_sensor_enable(sensor_list, 2, &s_bmi);
+    }
+    if (rslt == BMI2_OK) {
+        // descarta lo que hubiera quedado en la FIFO: se arranca en limpio
+        rslt = bmi2_set_command_register(BMI2_FIFO_FLUSH_CMD, &s_bmi);
+    }
+    if (rslt != BMI2_OK) {
+        ESP_LOGE(TAG, "resume fallo, rslt=%d", rslt);
+        return ESP_FAIL;
+    }
+    s_suspended = false;
+    ESP_LOGI(TAG, "BMI270 reanudado (accel+gyro, FIFO vaciada)");
     return ESP_OK;
 }
 

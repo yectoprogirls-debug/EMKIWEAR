@@ -81,6 +81,10 @@
  *                         Recomendado negociar MTU >= 96 antes de pedir INFO
  *                         por NOTIFY (si no, se trunca); por READ no hace
  *                         falta, el cliente BLE fragmenta solo.
+ *                  0xC0 = entrar en MODO CARGA (ver charge.h): el reloj avisa
+ *                         con BATT = 0xFF, cierra la conexion, apaga todo y
+ *                         duerme hasta que se mantenga el boton 2 s o pasen
+ *                         CHARGE_SLEEP_HOURS horas; entonces vuelve a publicitar.
  *         5 bytes: 0x10 + uint32 epoch_le  = sincronizar hora UNIX (s)
  *                  0x20 + uint32 seq_le    = confirmar resumenes recibidos hasta 'seq'
  *
@@ -112,6 +116,13 @@
  *         uint16 desplaz_mm   desplazamiento lineal pico-a-pico estimado en
  *                             la punta de los dedos (desplaz_cm), milimetros
  *
+ *   - BATT    7A9B0009-...  NOTIFY + READ   (bateria / aviso de modo carga)
+ *       1 byte:  0xFF = "entrando en modo carga" (se notifica ~500 ms antes
+ *                       de cerrar la conexion, en respuesta a CMD 0xC0)
+ *                0xFE = nivel desconocido. El hardware no mide el voltaje de
+ *                       la bateria: READ devuelve SIEMPRE este valor en
+ *                       funcionamiento normal.
+ *
  * El nombre en publicidad BLE es "ParkinsonWatch".
  * ---------------------------------------------------------------------------
  */
@@ -134,17 +145,32 @@ extern "C" {
 #define BLE_STATUS_FLAG_ANALIZANDO 0x40  /* bit6: aun no hay resultado valido; la app
                                           * muestra "Analizando..." */
 
+/* comando de CMD: entrar en modo carga */
+#define BLE_CMD_CHARGE_MODE       0xC0
+
+/* valores de BATT */
+#define BLE_BATT_CHARGE_MODE      0xFF   /* entrando en modo carga */
+#define BLE_BATT_UNKNOWN          0xFE   /* nivel desconocido */
+
 /* bits del campo 'flags2' de EXT */
 #define BLE_EXT_FLAG_ROTATIONAL  0x01
 
-/* Arranca el stack BLE y empieza a publicitar. Llamar una vez, despues de
- * nvs_flash_init(). */
+/* Arranca el stack BLE y empieza a publicitar. Llamar despues de
+ * nvs_flash_init(). Se puede volver a llamar tras ble_stream_deinit(); si el
+ * stack ya esta arriba no hace nada. */
 void ble_stream_init(void);
 
-/* false: desconecta al cliente y deja de publicitar (radio sin transmitir).
- * true: vuelve a publicitar para que la app se reconecte. Se puede llamar
- * desde cualquier tarea, incluso antes de ble_stream_init(). */
-void ble_stream_set_enabled(bool enabled);
+/* Para el reenvio periodico de STATUS (lo reactiva ble_stream_init()). */
+void ble_stream_stop_data(void);
+
+/* Cierra la conexion de forma ordenada, deja de publicitar y apaga por
+ * completo el host NimBLE y el controlador (radio apagada). Bloquea hasta
+ * ~2 s. NO llamar desde un callback de NimBLE. Ninguna otra tarea debe estar
+ * usando ble_stream_push_*() mientras tanto. */
+void ble_stream_deinit(void);
+
+/* Publica 1 byte en la caracteristica BATT (si hay cliente suscrito). */
+void ble_stream_push_battery(uint8_t value);
 
 /* true si hay un cliente (la app) conectado. */
 bool ble_stream_connected(void);
